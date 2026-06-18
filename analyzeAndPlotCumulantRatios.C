@@ -18,7 +18,8 @@
 #include <regex>
 #include <algorithm>
 #include <memory>
-
+#include <cmath>
+gErrorIgnoreLevel = kWarning;
 // ─── POD holding the cumulant ratios and errors extracted from one hQ ─────────
 struct CumulantResults {
   double k2k1{0}, k3k1{0}, k4k2{0};
@@ -37,13 +38,15 @@ TString getSpeciesLabel(int pdg)
   else if (pdg == -3212) species = "#Sigma^{+}";
   else if (pdg == 2212) species = "p";
   else if (pdg == -2212) species = "#bar{p}";
+  else if (pdg == 0) species = "h^{+}-h^{-}";
   else species = Form("PDG%d", pdg);
   return species;
 }
 
 // ─── Extract results from hQ_<label> ─────────────────────────────────────────
 CumulantResults extractResults(TFile& f, const std::string& label,
-                               double targetEvents = 4.5e9)
+                               double targetEvents = 4.5e9,
+                               bool net = false)
 {
   CumulantResults res;
   TH2D *h = (TH2D *)f.Get(Form("hQ_%s", label.c_str()));
@@ -58,6 +61,7 @@ CumulantResults extractResults(TFile& f, const std::string& label,
   double k2k1sq{0}, k3k1sq{0}, k4k2sq{0};
 
   const int nSamples = h->GetNbinsX();
+  int nUsed = 0;
 
   for (int i = 0; i < nSamples; ++i) {
     double e = h->GetBinContent(i + 1, 1);
@@ -67,32 +71,46 @@ CumulantResults extractResults(TFile& f, const std::string& label,
     double k2_tmp = h->GetBinContent(i + 1, 3) / e;
     double k3_tmp = h->GetBinContent(i + 1, 4) / e;
     double k4_tmp = h->GetBinContent(i + 1, 5) / e;
+    double ntot_tmp = h->GetBinContent(i + 1, 6) / e;
+
+    if (k1_tmp == 0.) continue;
+    if (k2_tmp == 0.) continue;
+    if (net && ntot_tmp == 0.) continue;
+
+    const double firstRatio = net ? (k2_tmp / ntot_tmp) : (k2_tmp / k1_tmp);
 
     res.nev += e;
+    ++nUsed;
     k1   += k1_tmp;    k2   += k2_tmp;
     k3   += k3_tmp;    k4   += k4_tmp;
-    k2k1 += k2_tmp / k1_tmp;
+    k2k1 += firstRatio;
     k3k1 += k3_tmp / k1_tmp;
     k4k2 += k4_tmp / k2_tmp;
 
     k1sq   += k1_tmp * k1_tmp;   k2sq   += k2_tmp * k2_tmp;
     k3sq   += k3_tmp * k3_tmp;   k4sq   += k4_tmp * k4_tmp;
-    k2k1sq += (k2_tmp / k1_tmp) * (k2_tmp / k1_tmp);
+    k2k1sq += firstRatio * firstRatio;
     k3k1sq += (k3_tmp / k1_tmp) * (k3_tmp / k1_tmp);
     k4k2sq += (k4_tmp / k2_tmp) * (k4_tmp / k2_tmp);
   }
 
-  k1   /= nSamples;   k2   /= nSamples;
-  k3   /= nSamples;   k4   /= nSamples;
-  k2k1 /= nSamples;   k3k1 /= nSamples;   k4k2 /= nSamples;
+  if (nUsed == 0) {
+    std::cout << "Warning: no valid subsamples for hQ_" << label << ", skipping." << std::endl;
+    return res;
+  }
 
-  k1sq   /= nSamples;   k2sq   /= nSamples;
-  k3sq   /= nSamples;   k4sq   /= nSamples;
-  k2k1sq /= nSamples;   k3k1sq /= nSamples;   k4k2sq /= nSamples;
+  k1   /= nUsed;   k2   /= nUsed;
+  k3   /= nUsed;   k4   /= nUsed;
+  k2k1 /= nUsed;   k3k1 /= nUsed;   k4k2 /= nUsed;
+
+  k1sq   /= nUsed;   k2sq   /= nUsed;
+  k3sq   /= nUsed;   k4sq   /= nUsed;
+  k2k1sq /= nUsed;   k3k1sq /= nUsed;   k4k2sq /= nUsed;
 
   // Standard error of the mean: sqrt(Var / (N*(N-1)))
   auto sampleErr = [&](double meanSq, double mean) {
-    return std::sqrt((meanSq - mean * mean) / (nSamples - 1));
+    if (nUsed < 2) return 0.0;
+    return std::sqrt((meanSq - mean * mean) / (nUsed - 1));
   };
 
   res.k2k1    = k2k1;   res.k3k1    = k3k1;   res.k4k2    = k4k2;
@@ -101,7 +119,7 @@ CumulantResults extractResults(TFile& f, const std::string& label,
   res.errK4K2 = sampleErr(k4k2sq, k4k2);
 
   // Scale factor: current stat → target stat (errors shrink as 1/sqrt(N))
-  const double errScale = std::sqrt(res.nev / targetEvents);
+  const double errScale = (targetEvents > 0.) ? std::sqrt(res.nev / targetEvents) : 0.;
   res.errK2K1R = res.errK2K1 * errScale;
   res.errK3K1R = res.errK3K1 * errScale;
   res.errK4K2R = res.errK4K2 * errScale;
@@ -111,26 +129,23 @@ CumulantResults extractResults(TFile& f, const std::string& label,
 }
 
 // ─── One plot per label: ideal points + non-ideal rescaled error bars ─────────
-bool analyseLabel(TFile& f, const std::string& label, TFile& fOut, double energy = 8.8, int pdg = 3122, bool net = false)
+bool analyseLabel(TFile& f, const std::string& label, TFile& fOut, double energy = 8.8, int pdg = 3122, bool net = false, double targetEvents = 4.5e9)
 {
-  const CumulantResults real  = extractResults(f, label);
-  const CumulantResults ideal = extractResults(f, label + "_ideal");
+  const CumulantResults real  = extractResults(f, label, targetEvents, net);
+  const CumulantResults ideal = extractResults(f, label + "_ideal", targetEvents, net);
 
   if (!real.valid || !ideal.valid) return false;
 
-  // ── Console summary ────────────────────────────────────────────────────────
-  auto printRes = [](const std::string& tag, const CumulantResults& r) {
-    std::cout << "\n=== " << tag << " ===" << std::endl;
-    std::cout << "N_ev  = " << r.nev << std::endl;
-    std::cout << "k2/k1 = " << r.k2k1 << " +/- " << r.errK2K1
-              << "  (rescaled: " << r.errK2K1R << ")" << std::endl;
-    std::cout << "k3/k1 = " << r.k3k1 << " +/- " << r.errK3K1
-              << "  (rescaled: " << r.errK3K1R << ")" << std::endl;
-    std::cout << "k4/k2 = " << r.k4k2 << " +/- " << r.errK4K2
-              << "  (rescaled: " << r.errK4K2R << ")" << std::endl;
-  };
-  printRes(label,          real);
-  printRes(label+"_ideal", ideal);
+  // ── Console summary: ideal values with real rescaled errors ─────────────────
+  const char* firstRatioLabel = net ? "k2/<Ntot>" : "k2/k1";
+  std::cout << "\n=== " << label << " (ideal values, real errors) ===" << std::endl;
+  std::cout << "N_ev  = " << ideal.nev << std::endl;
+  std::cout << firstRatioLabel << " = " << ideal.k2k1 << " +/- " << ideal.errK2K1
+            << "  (rescaled: " << real.errK2K1R << ")" << std::endl;
+  std::cout << "k3/k1 = " << ideal.k3k1 << " +/- " << ideal.errK3K1
+            << "  (rescaled: " << real.errK3K1R << ")" << std::endl;
+  std::cout << "k4/k2 = " << ideal.k4k2 << " +/- " << ideal.errK4K2
+            << "  (rescaled: " << real.errK4K2R << ")" << std::endl;
 
   // ── Output histogram: ideal central values, real rescaled errors ───────────
   TH1D hCR(Form("hCRescaled_%s", label.c_str()), ";Order;#kappa", 3, 0, 3);
@@ -150,7 +165,7 @@ bool analyseLabel(TFile& f, const std::string& label, TFile& fOut, double energy
   TH1D hFrame(Form("hFrame_%s", label.c_str()), ";;Cumulants ratio", 3, 0.5, 3.5);
   hFrame.SetMinimum(0.0);
   hFrame.SetMaximum(1.1);
-  hFrame.GetXaxis()->SetBinLabel(1, "#frac{#kappa_{2}(" + species + ")}{<" + species + ">}");
+  hFrame.GetXaxis()->SetBinLabel(1, "#frac{#kappa_{2}(" + species + ")}{<" + (pdg==0 ? "h^{+}+h^{-}" : species) + ">}");
   hFrame.GetXaxis()->SetBinLabel(2, "#frac{#kappa_{3}(" + species + ")}{<" + species + ">}");
   hFrame.GetXaxis()->SetBinLabel(3, "#frac{#kappa_{4}(" + species + ")}{#kappa_{2}(" + species + ")}");
   hFrame.GetXaxis()->SetLabelSize(0.065);
@@ -222,7 +237,8 @@ bool analyseLabel(TFile& f, const std::string& label, TFile& fOut, double energy
 // ─── Plot cumulant ratios vs eta upper cut, one canvas per pt range ───────────
 void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
                       TFile& fOut, double energy = 8.8,
-                      int pdg = 3122, bool net = false)
+                      int pdg = 3122, bool net = false,
+                      double targetEvents = 4.5e9)
 {
   // Collect unique pt-range tags (everything before "_eta_")
   std::vector<std::string> ptTags;
@@ -265,14 +281,17 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
   auto species = getSpeciesLabel(pdg);
   auto partSpecies = getSpeciesLabel(std::abs(pdg));
   auto antiSpecies = getSpeciesLabel(-std::abs(pdg));
-
+  if (pdg == 0) {
+    partSpecies = "h^{+}";
+    antiSpecies = "h^{-}";
+  }
   const std::string speciesStr = species.Data();
   const std::string partStr = partSpecies.Data();
   const std::string antiStr = antiSpecies.Data();
   const char* ratioNames[3]  = {"k2k1", "k3k1", "k4k2"};
   std::string ratioTitles[3];
   if (net) {
-    ratioTitles[0] = "#kappa_{2}(" + partStr + "+" + antiStr + ")/<" + partStr + "+" + antiStr + ">";
+    ratioTitles[0] = "#kappa_{2}(" + partStr + "-" + antiStr + ")/<" + partStr + "+" + antiStr + ">";
     ratioTitles[1] = "#kappa_{3}(" + partStr + "-" + antiStr + ")/#kappa_{1}(" + partStr + "-" + antiStr + ")";
     ratioTitles[2] = "#kappa_{4}(" + partStr + "-" + antiStr + ")/#kappa_{2}(" + partStr + "-" + antiStr + ")";
   } else {
@@ -307,8 +326,8 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
       auto [lo, hi]   = etaRange(lbl);
       etaLo = lo;
 
-      const CumulantResults real  = extractResults(fIn, lbl);
-      const CumulantResults ideal = extractResults(fIn, lbl + "_ideal");
+      const CumulantResults real  = extractResults(fIn, lbl, targetEvents, net);
+      const CumulantResults ideal = extractResults(fIn, lbl + "_ideal", targetEvents, net);
       if (!real.valid || !ideal.valid) {
         yK2K1[i] = yK3K1[i] = yK4K2[i] = 0.;
         eyK2K1[i] = eyK3K1[i] = eyK4K2[i] = 0.;
@@ -388,7 +407,7 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
 // ─── ki/kj vs eta_max overlaid for all pt selections ────────────────────────
 void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
                          TFile& fOut, double energy = 8.8,
-                         int pdg = 3122, bool net = false)
+                         int pdg = 3122, bool net = false, double targetEvents = 4.5e9)
 {
   auto etaRange = [](const std::string& lbl) -> std::pair<double,double> {
     auto pos = lbl.find("_eta_");
@@ -411,13 +430,17 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
   auto species = getSpeciesLabel(pdg);
   auto partSpecies = getSpeciesLabel(std::abs(pdg));
   auto antiSpecies = getSpeciesLabel(-std::abs(pdg));
+  if (pdg == 0) {
+    partSpecies = "h^{+}";
+    antiSpecies = "h^{-}";
+  }
   const std::string speciesStr = species.Data();
   const std::string partStr = partSpecies.Data();
   const std::string antiStr = antiSpecies.Data();
   const char* ratioNames[3]  = {"k2k1", "k3k1", "k4k2"};
   std::string ratioTitles[3];
   if (net) {
-    ratioTitles[0] = "#kappa_{2}(" + partStr + "+" + antiStr + ")/<" + partStr + "+" + antiStr + ">";
+    ratioTitles[0] = "#kappa_{2}(" + partStr + "-" + antiStr + ")/<" + partStr + "+" + antiStr + ">";
     ratioTitles[1] = "#kappa_{3}(" + partStr + "-" + antiStr + ")/#kappa_{1}(" + partStr + "-" + antiStr + ")";
     ratioTitles[2] = "#kappa_{4}(" + partStr + "-" + antiStr + ")/#kappa_{2}(" + partStr + "-" + antiStr + ")";
   } else {
@@ -474,8 +497,8 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
         }
       }
       if (lbl.empty()) continue;
-      const CumulantResults real  = extractResults(fIn, lbl);
-      const CumulantResults ideal = extractResults(fIn, lbl + "_ideal");
+      const CumulantResults real  = extractResults(fIn, lbl, targetEvents, net);
+      const CumulantResults ideal = extractResults(fIn, lbl + "_ideal", targetEvents, net);
       if (!real.valid || !ideal.valid) continue;
       yData[p][0][e]  = ideal.k2k1;  eyData[p][0][e]  = real.errK2K1R;
       yData[p][1][e]  = ideal.k3k1;  eyData[p][1][e]  = real.errK3K1R;
@@ -566,15 +589,20 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
-void analyzeAndPlotCumulantRatios(std::vector<std::string> labels = {
+/*std::vector<std::string> labels = {
                                           "pt0.2_2_eta_2_4", "pt0.5_2_eta_2_4", "pt0.75_2_eta_2_4", "pt1_2_eta_2_4",
                                           "pt0.2_2_eta_2_3", "pt0.5_2_eta_2_3",  "pt0.75_2_eta_2_3", "pt1_2_eta_2_3",
                                           "pt0.2_2_eta_2_3.5", "pt0.5_2_eta_2_3.5",  "pt0.75_2_eta_2_3.5", "pt1_2_eta_2_3.5",
                                           "pt0.2_2_eta_2_2.5", "pt0.5_2_eta_2_2.5",  "pt0.75_2_eta_2_2.5", "pt1_2_eta_2_2.5"
+                                        },*/
+void analyzeAndPlotCumulantRatios(std::vector<std::string> labels = {
+                                          "pt0.2_2.5_eta_2_3.5"                                    
                                         },
                                         double energy = 7.5,
-                                        int pdg = 3122,
-                                        bool net = false)
+                                        int pdg = 0,
+                                        bool net = true,
+                                        double targetEvents = 4.5e9
+                                      )
 {
   TFile fIn("fOutAll.root");
   if (fIn.IsZombie()) {
@@ -585,10 +613,10 @@ void analyzeAndPlotCumulantRatios(std::vector<std::string> labels = {
   TFile fOut("fC.root", "RECREATE");
 
   for (const std::string& lbl : labels)
-    analyseLabel(fIn, lbl, fOut, energy, pdg, net);
+    analyseLabel(fIn, lbl, fOut, energy, pdg, net, targetEvents);
 
-  analyseVsEtaCuts(fIn, labels, fOut, energy, pdg, net);
-  analyseVsEtaOverlay(fIn, labels, fOut, energy, pdg, net);
+  analyseVsEtaCuts(fIn, labels, fOut, energy, pdg, net, targetEvents);
+  analyseVsEtaOverlay(fIn, labels, fOut, energy, pdg, net, targetEvents);
 
   fOut.Close();
 }

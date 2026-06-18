@@ -25,13 +25,33 @@ std::vector<std::string> getFiles(const std::string& pattern) {
   globfree(&glob_result);
   return files;
 }
+// list of PDG codes to reject (for pdgToSelect = 0)
+const std::vector<int> rejectList = {22, // photon
+                                      111, // pi0
+                                      130, // K0L
+                                      2112, // neutron
+                                      -2112, // anti-neutron
+                                    }; // proton and anti-proton
+
+//---------------------------------------------
+// Utility: check if PDG is in reject list
+//---------------------------------------------
+bool isRejected(int pdg, const std::vector<int>& rejectList) {
+  for (int rejected : rejectList) {
+    if (std::abs(pdg) == rejected) {
+      return true;
+    }
+  }
+  return false;
+}
 
 //---------------------------------------------
 // Main parser
 //---------------------------------------------
 void parser(
     std::string pattern = "/home/galocco/TheFIST_PbPb_8.77GeV_HEP/job_1/PbPb.8.77.C0-5.dat",
-    int pdgToSelect = 3122) {
+    int pdgToSelect = 3122 // Default: select Lambda (PDG 3122), 0 means select all but those in the reject list
+  ) { 
 
   // Output
   TFile outputFile("output.root", "recreate");
@@ -47,7 +67,6 @@ void parser(
   tree.Branch("py", &py);
   tree.Branch("pz", &pz);
   tree.Branch("E", &E);
-
   // Get all files
   auto files = getFiles(pattern);
 
@@ -95,8 +114,9 @@ void parser(
       double rap = mom.Rapidity();
       double p = mom.P();
 
+      bool rejected = isRejected(pdg, rejectList);
       // Selection
-      if (std::abs(pdg) == pdgToSelect) {
+      if (std::abs(pdg) == pdgToSelect || pdgToSelect == 0 && !rejected) {
         tree.Fill();
       }
     }
