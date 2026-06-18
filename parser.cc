@@ -1,5 +1,6 @@
 #include <TFile.h>
 #include <TLorentzVector.h>
+#include <TDatabasePDG.h>
 #include <TTree.h>
 
 #include <glob.h>
@@ -46,11 +47,22 @@ bool isRejected(int pdg, const std::vector<int>& rejectList) {
 }
 
 //---------------------------------------------
+// Utility: check if PDG is a short-lived particle
+//---------------------------------------------
+bool isShortLived(int pdg) {
+  auto* particle = TDatabasePDG::Instance()->GetParticle(pdg);
+  if (!particle) return true; // unknown PDG → treat as short-lived (reject)
+  double lifetime = particle->Lifetime(); // seconds
+  return lifetime < 1.23794e-08; // threshold for short-lived particles < kaon lifetime
+}
+
+//---------------------------------------------
 // Main parser
 //---------------------------------------------
 void parser(
     std::string pattern = "/home/galocco/TheFIST_PbPb_8.77GeV_HEP/job_1/PbPb.8.77.C0-5.dat",
-    int pdgToSelect = 3122 // Default: select Lambda (PDG 3122), 0 means select all but those in the reject list
+    int pdgToSelect = 3122, // Default: select Lambda (PDG 3122), 0 means select all but those in the reject list
+    bool rejectShortLived = false  // Default: reject short-lived particles (those with PDG codes in the reject list)
   ) { 
 
   // Output
@@ -59,14 +71,12 @@ void parser(
 
   int event = -1;
   int pdg = 0;
-  float px = 0.f, py = 0.f, pz = 0.f, E = 0.f;
+  float px = 0.f, py = 0.f, pz = 0.f, E = 0.f, pt = 0.f;
 
   tree.Branch("event", &event);
   tree.Branch("pdg", &pdg);
-  tree.Branch("px", &px);
-  tree.Branch("py", &py);
   tree.Branch("pz", &pz);
-  tree.Branch("E", &E);
+  tree.Branch("pt", &pt);
   // Get all files
   auto files = getFiles(pattern);
 
@@ -109,10 +119,8 @@ void parser(
       split >> type >> barcode >> parent >> pdg
             >> px >> py >> pz >> E >> mass >> status;
 
-      TLorentzVector mom(px, py, pz, E);
-
-      double rap = mom.Rapidity();
-      double p = mom.P();
+      if (rejectShortLived && isShortLived(pdg)) continue;
+      pt = std::sqrt(px * px + py * py);
 
       bool rejected = isRejected(pdg, rejectList);
       // Selection

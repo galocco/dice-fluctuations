@@ -2,6 +2,15 @@
 // Cumulant post-processing and plotting pipeline
 //
 // Most credits go to Mario Ciacco.
+//
+// Reads raw accumulators (hRawAcc_* TH2D) written by
+// computeMCCumulantsWithEfficiency.  The input file can be the
+// direct output of one compute run, or the result of
+//
+//   hadd merged.root fOutAll_run1.root fOutAll_run2.root ...
+//
+// hadd sums TH2D bins, so the merged file is equivalent to a
+// single run over all input events.
 // ============================================================
 
 #include <TFile.h>
@@ -20,7 +29,35 @@
 #include <memory>
 #include <cmath>
 gErrorIgnoreLevel = kWarning;
-// ─── POD holding the cumulant ratios and errors extracted from one hQ ─────────
+
+// ─── Accumulator field layout ────────────────────────────────────────────────
+// Must stay in sync with writeRawAccumulators in the compute macro.
+static const int kNAccFields = 22;
+// Y-bin → field name (for documentation only)
+//  1: nEventsPerSample
+//  2: qAcc_1_1_1
+//  3: qAcc_2_1_1
+//  4: qAcc_1_2_1
+//  5: qAcc_1_2_2
+//  6: qAcc_3_1_1
+//  7: qAcc_1_1_1_x_1_2_1
+//  8: qAcc_1_1_1_x_1_2_2
+//  9: qAcc_1_3_2
+// 10: qAcc_1_3_3
+// 11: qAcc_4_1_1
+// 12: qAcc_2_1_1_x_1_2_1
+// 13: qAcc_2_1_1_x_1_2_2
+// 14: qAcc_2_2_1
+// 15: qAcc_2_2_2
+// 16: qAcc_1_1_1_x_1_3_2
+// 17: qAcc_1_1_1_x_1_3_3
+// 18: qAcc_1_2_1_x_1_2_2
+// 19: qAcc_1_4_1
+// 20: qAcc_1_4_2
+// 21: qAcc_1_4_3
+// 22: qAcc_1_4_4
+
+// ─── POD holding the cumulant ratios and errors extracted from one hRawAcc ───
 struct CumulantResults {
   double k2k1{0}, k3k1{0}, k4k2{0};
   double errK2K1{0}, errK3K1{0}, errK4K2{0};    // subsample standard errors
@@ -43,69 +80,116 @@ TString getSpeciesLabel(int pdg)
   return species;
 }
 
-// ─── Extract results from hQ_<label> ─────────────────────────────────────────
+// ─── Read raw accumulators from hRawAcc_<label> and compute cumulants ────────
+//
+// Each X-bin of hRawAcc is one subsample; each Y-bin is one accumulator field.
+// After hadd the bin contents are the *sum* over all merged files, which is
+// exactly what we want before dividing by nEvents.
+//
 CumulantResults extractResults(TFile& f, const std::string& label,
                                double targetEvents = 4.5e9,
                                bool net = false)
 {
   CumulantResults res;
-  TH2D *h = (TH2D *)f.Get(Form("hQ_%s", label.c_str()));
+  TH2D *h = (TH2D *)f.Get(Form("hRawAcc_%s", label.c_str()));
   if (!h) {
-    std::cout << "Warning: hQ_" << label << " not found, skipping." << std::endl;
+    std::cout << "Warning: hRawAcc_" << label << " not found, skipping." << std::endl;
     return res;
   }
 
-  double k1{0}, k2{0}, k3{0}, k4{0};
-  double k2k1{0}, k3k1{0}, k4k2{0};
-  double k1sq{0}, k2sq{0}, k3sq{0}, k4sq{0};
-  double k2k1sq{0}, k3k1sq{0}, k4k2sq{0};
-
   const int nSamples = h->GetNbinsX();
+
+  double k2k1{0}, k3k1{0}, k4k2{0};
+  double k2k1sq{0}, k3k1sq{0}, k4k2sq{0};
   int nUsed = 0;
 
-  for (int i = 0; i < nSamples; ++i) {
-    double e = h->GetBinContent(i + 1, 1);
-    if (e <= 0.) continue;
+  for (int s = 0; s < nSamples; ++s) {
+    // Column s+1 of hRawAcc: read all fields
+    double nEv = h->GetBinContent(s + 1,  1); // nEventsPerSample
+    if (nEv < 1.) continue;
 
-    double k1_tmp = h->GetBinContent(i + 1, 2) / e;
-    double k2_tmp = h->GetBinContent(i + 1, 3) / e;
-    double k3_tmp = h->GetBinContent(i + 1, 4) / e;
-    double k4_tmp = h->GetBinContent(i + 1, 5) / e;
-    double ntot_tmp = h->GetBinContent(i + 1, 6) / e;
+    double acc_1_1_1         = h->GetBinContent(s + 1,  2);
+    double acc_2_1_1         = h->GetBinContent(s + 1,  3);
+    double acc_1_2_1         = h->GetBinContent(s + 1,  4);
+    double acc_1_2_2         = h->GetBinContent(s + 1,  5);
+    double acc_3_1_1         = h->GetBinContent(s + 1,  6);
+    double acc_1_1_1_x_1_2_1 = h->GetBinContent(s + 1,  7);
+    double acc_1_1_1_x_1_2_2 = h->GetBinContent(s + 1,  8);
+    double acc_1_3_2         = h->GetBinContent(s + 1,  9);
+    double acc_1_3_3         = h->GetBinContent(s + 1, 10);
+    double acc_4_1_1         = h->GetBinContent(s + 1, 11);
+    double acc_2_1_1_x_1_2_1 = h->GetBinContent(s + 1, 12);
+    double acc_2_1_1_x_1_2_2 = h->GetBinContent(s + 1, 13);
+    double acc_2_2_1         = h->GetBinContent(s + 1, 14);
+    double acc_2_2_2         = h->GetBinContent(s + 1, 15);
+    double acc_1_1_1_x_1_3_2 = h->GetBinContent(s + 1, 16);
+    double acc_1_1_1_x_1_3_3 = h->GetBinContent(s + 1, 17);
+    double acc_1_2_1_x_1_2_2 = h->GetBinContent(s + 1, 18);
+    double acc_1_4_1         = h->GetBinContent(s + 1, 19);
+    double acc_1_4_2         = h->GetBinContent(s + 1, 20);
+    double acc_1_4_3         = h->GetBinContent(s + 1, 21);
+    double acc_1_4_4         = h->GetBinContent(s + 1, 22);
 
-    if (k1_tmp == 0.) continue;
-    if (k2_tmp == 0.) continue;
-    if (net && ntot_tmp == 0.) continue;
+    // ── Raw moments (Eqs. 62–65) ─────────────────────────────────────────────
+    double M1 = acc_1_1_1 / nEv;
 
-    const double firstRatio = net ? (k2_tmp / ntot_tmp) : (k2_tmp / k1_tmp);
+    double M2 = (acc_2_1_1 + acc_1_2_1 - acc_1_2_2) / nEv;
 
-    res.nev += e;
+    double M3 = (acc_3_1_1
+                 + 3. * acc_1_1_1_x_1_2_1
+                 - 3. * acc_1_1_1_x_1_2_2
+                 +      acc_1_1_1
+                 - 3. * acc_1_3_2
+                 + 2. * acc_1_3_3) / nEv;
+
+    double M4 = (acc_4_1_1
+                 + 6. * acc_2_1_1_x_1_2_1
+                 - 6. * acc_2_1_1_x_1_2_2
+                 + 4. * acc_2_1_1
+                 + 3. * acc_2_2_1
+                 + 3. * acc_2_2_2
+                 - 12.* acc_1_1_1_x_1_3_2
+                 + 8. * acc_1_1_1_x_1_3_3
+                 - 6. * acc_1_2_1_x_1_2_2
+                 +      acc_1_4_1
+                 - 7. * acc_1_4_2
+                 + 12.* acc_1_4_3
+                 - 6. * acc_1_4_4) / nEv;
+
+    // ── Cumulants ────────────────────────────────────────────────────────────
+    double C1 = M1;
+    double C2 = M2 - M1 * M1;
+    double C3 = M3 - 3. * M2 * M1 + 2. * M1 * M1 * M1;
+    double C4 = M4 - 4. * M3 * M1 - 3. * M2 * M2
+                   + 12. * M2 * M1 * M1 - 6. * M1 * M1 * M1 * M1;
+
+    // <N+ + N-> per event
+    double Ntot = acc_1_2_1 / nEv;
+
+    if (C1 == 0.) continue;
+    if (C2 == 0.) continue;
+    if (net && Ntot == 0.) continue;
+
+    const double firstRatio = net ? (C2 / Ntot) : (C2 / C1);
+    const double r3k1 = C3 / C1;
+    const double r4k2 = C4 / C2;
+
+    res.nev += nEv;
     ++nUsed;
-    k1   += k1_tmp;    k2   += k2_tmp;
-    k3   += k3_tmp;    k4   += k4_tmp;
-    k2k1 += firstRatio;
-    k3k1 += k3_tmp / k1_tmp;
-    k4k2 += k4_tmp / k2_tmp;
 
-    k1sq   += k1_tmp * k1_tmp;   k2sq   += k2_tmp * k2_tmp;
-    k3sq   += k3_tmp * k3_tmp;   k4sq   += k4_tmp * k4_tmp;
-    k2k1sq += firstRatio * firstRatio;
-    k3k1sq += (k3_tmp / k1_tmp) * (k3_tmp / k1_tmp);
-    k4k2sq += (k4_tmp / k2_tmp) * (k4_tmp / k2_tmp);
+    k2k1   += firstRatio;   k2k1sq   += firstRatio * firstRatio;
+    k3k1   += r3k1;         k3k1sq   += r3k1 * r3k1;
+    k4k2   += r4k2;         k4k2sq   += r4k2 * r4k2;
   }
 
   if (nUsed == 0) {
-    std::cout << "Warning: no valid subsamples for hQ_" << label << ", skipping." << std::endl;
+    std::cout << "Warning: no valid subsamples for hRawAcc_" << label
+              << ", skipping." << std::endl;
     return res;
   }
 
-  k1   /= nUsed;   k2   /= nUsed;
-  k3   /= nUsed;   k4   /= nUsed;
   k2k1 /= nUsed;   k3k1 /= nUsed;   k4k2 /= nUsed;
-
-  k1sq   /= nUsed;   k2sq   /= nUsed;
-  k3sq   /= nUsed;   k4sq   /= nUsed;
-  k2k1sq /= nUsed;   k3k1sq /= nUsed;   k4k2sq /= nUsed;
+  k2k1sq /= nUsed; k3k1sq /= nUsed; k4k2sq /= nUsed;
 
   // Standard error of the mean: sqrt(Var / (N*(N-1)))
   auto sampleErr = [&](double meanSq, double mean) {
@@ -129,7 +213,9 @@ CumulantResults extractResults(TFile& f, const std::string& label,
 }
 
 // ─── One plot per label: ideal points + non-ideal rescaled error bars ─────────
-bool analyseLabel(TFile& f, const std::string& label, TFile& fOut, double energy = 8.8, int pdg = 3122, bool net = false, double targetEvents = 4.5e9)
+bool analyseLabel(TFile& f, const std::string& label, TFile& fOut,
+                  double energy = 8.8, int pdg = 3122,
+                  bool net = false, double targetEvents = 4.5e9)
 {
   const CumulantResults real  = extractResults(f, label, targetEvents, net);
   const CumulantResults ideal = extractResults(f, label + "_ideal", targetEvents, net);
@@ -174,8 +260,6 @@ bool analyseLabel(TFile& f, const std::string& label, TFile& fOut, double energy
   gStyle->SetOptStat(0);
   hFrame.Draw("AXIS");
 
-  // Points: ideal efficiency values (unbiased by detector)
-  // Error bars: real efficiency subsample errors rescaled to target statistics
   double x[3]  = {1.0, 2.0, 3.0};
   double ex[3] = {0., 0., 0.};
   double y[3]  = {ideal.k2k1,    ideal.k3k1,    ideal.k4k2};
@@ -194,32 +278,27 @@ bool analyseLabel(TFile& f, const std::string& label, TFile& fOut, double energy
   latex.SetTextSize(0.04);
   latex.SetTextFont(42);
   latex.DrawLatex(0.19, 0.47,       "NA60+/DiCE Performance");
-  latex.DrawLatex(0.19, 0.47-0.05,  
+  latex.DrawLatex(0.19, 0.47-0.05,
       Form("Pb#font[122]{-}Pb,  #sqrt{s_{NN}} = %0.1f GeV, 0-5%%", energy));
+
   std::regex number_regex(R"([0-9]*\.?[0-9]+)");
   std::sregex_iterator it(label.begin(), label.end(), number_regex);
   std::sregex_iterator end;
-
   std::vector<double> numbers;
+  for (; it != end; ++it)
+    numbers.push_back(std::stod(it->str()));
 
-  for (; it != end; ++it) {
-      numbers.push_back(std::stod(it->str()));
-  }
-
-  auto fmt = [](double x) {
-      // se è praticamente intero → niente decimali
-      if (std::fabs(x - std::round(x)) < 1e-6)
-          return Form("%.0f", x);
-      // se ha una sola cifra significativa → 1 decimale
-      if (std::fabs(x * 10 - std::round(x * 10)) < 1e-6)
-          return Form("%.1f", x);
-      // altrimenti → 2 decimali
-      return Form("%.2f", x);
+  auto fmt = [](double x) -> const char* {
+    if (std::fabs(x - std::round(x)) < 1e-6)
+      return Form("%.0f", x);
+    if (std::fabs(x * 10 - std::round(x * 10)) < 1e-6)
+      return Form("%.1f", x);
+    return Form("%.2f", x);
   };
+
   latex.DrawLatex(0.19, 0.47-0.10,
       Form("%s #leq #it{#eta} #leq %s",
           fmt(numbers[2]), fmt(numbers[3])));
-
   latex.DrawLatex(0.19, 0.47-0.15,
       Form("%s #leq #it{p}_{T} #leq %s GeV/#it{c}",
           fmt(numbers[0]), fmt(numbers[1])));
@@ -240,7 +319,6 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
                       int pdg = 3122, bool net = false,
                       double targetEvents = 4.5e9)
 {
-  // Collect unique pt-range tags (everything before "_eta_")
   std::vector<std::string> ptTags;
   for (const auto& lbl : labels) {
     auto pos = lbl.find("_eta_");
@@ -250,21 +328,18 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
       ptTags.push_back(tag);
   }
 
-  // Helper: parse the two eta numbers from a label like "pt0.2_2_eta_2_3.5"
   auto etaRange = [](const std::string& lbl) -> std::pair<double,double> {
     auto pos = lbl.find("_eta_");
     if (pos == std::string::npos) return {0,0};
-    std::string etaPart = lbl.substr(pos + 5); // e.g. "2_3.5"
+    std::string etaPart = lbl.substr(pos + 5);
     auto us = etaPart.find('_');
     double lo = std::stod(etaPart.substr(0, us));
     double hi = std::stod(etaPart.substr(us + 1));
     return {lo, hi};
   };
 
-  // Helper: parse the two pt numbers from the tag like "pt0.2_2"
   auto ptRange = [](const std::string& tag) -> std::pair<double,double> {
-    // tag = "pt<lo>_<hi>"
-    std::string s = tag.substr(2); // remove "pt"
+    std::string s = tag.substr(2);
     auto us = s.find('_');
     double lo = std::stod(s.substr(0, us));
     double hi = std::stod(s.substr(us + 1));
@@ -277,7 +352,6 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
     return Form("%.2f", v);
   };
 
-  // Ratio names and titles
   auto species = getSpeciesLabel(pdg);
   auto partSpecies = getSpeciesLabel(std::abs(pdg));
   auto antiSpecies = getSpeciesLabel(-std::abs(pdg));
@@ -301,7 +375,6 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
   }
 
   for (const auto& tag : ptTags) {
-    // Collect all labels belonging to this pt tag, sorted by eta upper cut
     std::vector<std::pair<double,std::string>> etaLabels;
     for (const auto& lbl : labels) {
       if (lbl.find(tag + "_eta_") == 0) {
@@ -313,7 +386,6 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
     const int N = (int)etaLabels.size();
     if (N == 0) continue;
 
-    // Build arrays
     std::vector<double> etaHi(N), ex(N, 0.);
     std::vector<double> yK2K1(N), eyK2K1(N);
     std::vector<double> yK3K1(N), eyK3K1(N);
@@ -323,7 +395,7 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
     for (int i = 0; i < N; ++i) {
       etaHi[i] = etaLabels[i].first;
       const auto& lbl = etaLabels[i].second;
-      auto [lo, hi]   = etaRange(lbl);
+      auto [lo, hi] = etaRange(lbl);
       etaLo = lo;
 
       const CumulantResults real  = extractResults(fIn, lbl, targetEvents, net);
@@ -340,7 +412,6 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
 
     auto [ptLo, ptHi] = ptRange(tag);
 
-    // One canvas per ratio
     double* yArr[3]  = {yK2K1.data(),  yK3K1.data(),  yK4K2.data()};
     double* eyArr[3] = {eyK2K1.data(), eyK3K1.data(), eyK4K2.data()};
 
@@ -353,7 +424,6 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
       c.SetTopMargin(0.05);
       c.SetRightMargin(0.04);
 
-      // determine y range: max fixed at 1.02, min = (min y - err) - 0.2
       double yminErr = yArr[r][0] - eyArr[r][0];
       for (int j = 1; j < N; ++j)
         yminErr = std::min(yminErr, yArr[r][j] - eyArr[r][j]);
@@ -454,7 +524,6 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
   const int nColors = (int)(sizeof(kColors)/sizeof(kColors[0]));
   const int kMarkers[] = {20, 21, 22, 23, 29, 33, 34, 47};
 
-  // Collect unique pt tags (sorted by pt lo)
   std::vector<std::string> ptTags;
   for (const auto& lbl : labels) {
     auto pos = lbl.find("_eta_");
@@ -464,7 +533,6 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
       ptTags.push_back(tag);
   }
 
-  // Collect unique eta upper cuts (sorted)
   std::vector<double> etaHiAll;
   for (const auto& lbl : labels) {
     double hi = etaRange(lbl).second;
@@ -474,13 +542,10 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
   std::sort(etaHiAll.begin(), etaHiAll.end());
   const int Neta = (int)etaHiAll.size();
 
-  // eta lo (assume same for all)
   double etaLo = 0.;
   for (const auto& lbl : labels) { etaLo = etaRange(lbl).first; break; }
 
-  // For each pt tag build arrays over eta upper cuts
   const int Npt = (int)ptTags.size();
-  // yData[pt][ratio][etaIdx]
   std::vector<std::vector<std::vector<double>>> yData(Npt,
       std::vector<std::vector<double>>(3, std::vector<double>(Neta, 0.)));
   std::vector<std::vector<std::vector<double>>> eyData(Npt,
@@ -488,7 +553,6 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
 
   for (int p = 0; p < Npt; ++p) {
     for (int e = 0; e < Neta; ++e) {
-      // find matching label
       std::string lbl;
       for (const auto& l : labels) {
         if (l.find(ptTags[p] + "_eta_") == 0 &&
@@ -509,7 +573,6 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
   std::vector<double> ex(Neta, 0.);
 
   for (int r = 0; r < 3; ++r) {
-    // y range across all pt tags
     double yminErr = 1e9;
     for (int p = 0; p < Npt; ++p)
       for (int e = 0; e < Neta; ++e)
@@ -536,7 +599,6 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
     gStyle->SetOptStat(0);
     hF.Draw("AXIS");
 
-    // keep points exactly at eta_{max}
     std::vector<std::unique_ptr<TGraphErrors>> graphs(Npt);
     for (int p = 0; p < Npt; ++p) {
       std::vector<double> xs(Neta);
@@ -553,7 +615,6 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
       graphs[p]->Draw("P SAME");
     }
 
-    // Legend
     double legY2 = 0.50;
     TLegend leg(0.2, legY2 - 0.05*Npt, 0.55, legY2);
     leg.SetBorderSize(0);
@@ -571,10 +632,10 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
     latex.SetNDC();
     latex.SetTextSize(0.038);
     latex.SetTextFont(42);
-    latex.DrawLatex(0.2 +0.015, legY2 - 0.05*Npt - 0.03, "NA60+/DiCE Performance");
-    latex.DrawLatex(0.2 +0.015, legY2 - 0.05*Npt - 0.08,
+    latex.DrawLatex(0.2+0.015, legY2 - 0.05*Npt - 0.03, "NA60+/DiCE Performance");
+    latex.DrawLatex(0.2+0.015, legY2 - 0.05*Npt - 0.08,
         Form("Pb#font[122]{-}Pb,  #sqrt{s_{NN}} = %0.1f GeV, 0-5%%", energy));
-    latex.DrawLatex(0.2 +0.015, legY2 - 0.05*Npt - 0.13,
+    latex.DrawLatex(0.2+0.015, legY2 - 0.05*Npt - 0.13,
         Form("%s #leq #it{#eta} #leq #it{#eta}_{max}", fmt(etaLo)));
 
     c.SaveAs(Form("vsEtaOverlay_%s.pdf", ratioNames[r]));
@@ -589,24 +650,19 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
-/*std::vector<std::string> labels = {
-                                          "pt0.2_2_eta_2_4", "pt0.5_2_eta_2_4", "pt0.75_2_eta_2_4", "pt1_2_eta_2_4",
-                                          "pt0.2_2_eta_2_3", "pt0.5_2_eta_2_3",  "pt0.75_2_eta_2_3", "pt1_2_eta_2_3",
-                                          "pt0.2_2_eta_2_3.5", "pt0.5_2_eta_2_3.5",  "pt0.75_2_eta_2_3.5", "pt1_2_eta_2_3.5",
-                                          "pt0.2_2_eta_2_2.5", "pt0.5_2_eta_2_2.5",  "pt0.75_2_eta_2_2.5", "pt1_2_eta_2_2.5"
-                                        },*/
 void analyzeAndPlotCumulantRatios(std::vector<std::string> labels = {
-                                          "pt0.2_2.5_eta_2_3.5"                                    
+                                          "pt0.2_2.5_eta_2_3.5"
                                         },
                                         double energy = 7.5,
                                         int pdg = 0,
                                         bool net = true,
-                                        double targetEvents = 4.5e9
+                                        double targetEvents = 4.5e9,
+                                        TString inputFile = "fOutAll.root"
                                       )
 {
-  TFile fIn("fOutAll.root");
+  TFile fIn(inputFile);
   if (fIn.IsZombie()) {
-    std::cout << "Error: cannot open fOutAll.root" << std::endl;
+    std::cout << "Error: cannot open " << inputFile << std::endl;
     return;
   }
 

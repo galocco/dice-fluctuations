@@ -2,6 +2,10 @@
 // Cumulant MC processing and efficiency correction pipeline
 //
 // Most credits go to Mario Ciacco.
+//
+// Raw accumulators are saved as TH2D (sample × accumulator field)
+// so that multiple output files can be merged with hadd before
+// running analyzeAndPlotCumulantRatios.
 // ============================================================
 
 #include <TEfficiency.h>
@@ -31,6 +35,12 @@ struct CutSet
   double ptMax;
   double etaMin;
   double etaMax;
+};
+
+// ─── Particle info struct ─────────────────────────────────────────────────────
+struct ParticleInfo {
+  int charge;
+  double mass;
 };
 
 // ─── Per-cut-set accumulators ────────────────────────────────────────────────
@@ -67,6 +77,36 @@ struct Accumulators
   double qAcc_1_4_3[nSamples]{};
   double qAcc_1_4_4[nSamples]{};
 };
+
+// ─── Accumulator field layout (must match writeRawAccumulators / readRawAccumulators)
+//
+// Y-axis bin → field mapping:
+//   bin 1  → nEventsPerSample
+//   bin 2  → qAcc_1_1_1
+//   bin 3  → qAcc_2_1_1
+//   bin 4  → qAcc_1_2_1
+//   bin 5  → qAcc_1_2_2
+//   bin 6  → qAcc_3_1_1
+//   bin 7  → qAcc_1_1_1_x_1_2_1
+//   bin 8  → qAcc_1_1_1_x_1_2_2
+//   bin 9  → qAcc_1_3_2
+//   bin 10 → qAcc_1_3_3
+//   bin 11 → qAcc_4_1_1
+//   bin 12 → qAcc_2_1_1_x_1_2_1
+//   bin 13 → qAcc_2_1_1_x_1_2_2
+//   bin 14 → qAcc_2_2_1
+//   bin 15 → qAcc_2_2_2
+//   bin 16 → qAcc_1_1_1_x_1_3_2
+//   bin 17 → qAcc_1_1_1_x_1_3_3
+//   bin 18 → qAcc_1_2_1_x_1_2_2
+//   bin 19 → qAcc_1_4_1
+//   bin 20 → qAcc_1_4_2
+//   bin 21 → qAcc_1_4_3
+//   bin 22 → qAcc_1_4_4
+//
+// Total Y bins: 22  (kNAccFields)
+
+static const int kNAccFields = 22;
 
 // ─── Helper utilities ─────────────────────────────────────────────────────────
 std::vector<double> buildTargetProbabilities(int nTargets)
@@ -114,70 +154,67 @@ int getTarget(const std::vector<double> &probs)
   return static_cast<int>(probs.size()) - 1;
 }
 
-// ─── Write one hQ histogram from a filled Accumulators object ────────────────
+// ─── Write raw accumulators as TH2D(sample × field) ─────────────────────────
 //
-// Bin layout (Y axis):
-//   bin 1 → nEvents
-//   bin 2 → C1  (= κ₁ = <N+ - N->)
-//   bin 3 → C2  (= κ₂)
-//   bin 4 → C3  (= κ₃)
-//   bin 5 → C4  (= κ₄)
-//   bin 6 → <N+ + N->  (= qTot(1), needed for K2/<Ntot> normalisation)
+// Axis layout:
+//   X : sample index  [1 .. nSamples]
+//   Y : field index   [1 .. kNAccFields]  (see mapping above)
 //
-void writeAccumulators(const Accumulators &acc, const std::string &label, TFile *fOut)
+// hadd sums TH2D bin-by-bin, so merging multiple output files before
+// running analyzeAndPlotCumulantRatios is equivalent to processing all
+// input events in a single run.
+//
+void writeRawAccumulators(const Accumulators &acc,
+                          const std::string &label,
+                          TFile *fOut)
 {
-  TH2D hQ(Form("hQ_%s", label.c_str()),
-          Form("%s;sample;order;Q_{n}", label.c_str()),
-          nSamples, 0, nSamples, 6, 0, 6); // 6 bins on Y
+  TH2D hRaw(Form("hRawAcc_%s", label.c_str()),
+            Form("Raw accumulators %s;sample;field", label.c_str()),
+            nSamples, 0, nSamples,
+            kNAccFields, 0, kNAccFields);
 
-  for (int s = 0; s < nSamples; ++s)
+  // Lambda: set one field row for all samples
+  auto setRow = [&](int yBin, const double *arr)
   {
-    double nEv = acc.nEventsPerSample[s];
-    if (nEv < 1.)
-      continue;
+    for (int s = 0; s < nSamples; ++s)
+      hRaw.SetBinContent(s + 1, yBin, arr[s]);
+  };
 
-    // Eq. (62): first raw moment
-    double M1 = acc.qAcc_1_1_1[s] / nEv;
-
-    // Eq. (63): second raw moment
-    double M2 = (acc.qAcc_2_1_1[s] + acc.qAcc_1_2_1[s] - acc.qAcc_1_2_2[s]) / nEv;
-
-    // Eq. (64): third raw moment
-    double M3 = (acc.qAcc_3_1_1[s] + 3. * acc.qAcc_1_1_1_x_1_2_1[s] - 3. * acc.qAcc_1_1_1_x_1_2_2[s] + acc.qAcc_1_1_1[s] - 3. * acc.qAcc_1_3_2[s] + 2. * acc.qAcc_1_3_3[s]) / nEv;
-
-    // Eq. (65): fourth raw moment
-    double M4 = (acc.qAcc_4_1_1[s] + 6. * acc.qAcc_2_1_1_x_1_2_1[s] - 6. * acc.qAcc_2_1_1_x_1_2_2[s] + 4. * acc.qAcc_2_1_1[s] + 3. * acc.qAcc_2_2_1[s] + 3. * acc.qAcc_2_2_2[s] - 12. * acc.qAcc_1_1_1_x_1_3_2[s] + 8. * acc.qAcc_1_1_1_x_1_3_3[s] - 6. * acc.qAcc_1_2_1_x_1_2_2[s] + acc.qAcc_1_4_1[s] - 7. * acc.qAcc_1_4_2[s] + 12. * acc.qAcc_1_4_3[s] - 6. * acc.qAcc_1_4_4[s]) / nEv;
-
-    // Raw moments → cumulants
-    double C1 = M1;
-    double C2 = M2 - M1 * M1;
-    double C3 = M3 - 3. * M2 * M1 + 2. * M1 * M1 * M1;
-    double C4 = M4 - 4. * M3 * M1 - 3. * M2 * M2 + 12. * M2 * M1 * M1 - 6. * M1 * M1 * M1 * M1;
-
-    // <N+ + N-> per event = qTot(1) / nEv
-    // qAcc_1_2_1 accumulates qTot(1) = N+/eff^1 + N-/eff^1 per event.
-    // For the ideal slot (eff=1) this is exactly <N+> + <N->.
-    // For the real slot it is the efficiency-weighted sum, consistent with
-    // the rest of the correction scheme.
-    double Ntot = acc.qAcc_1_2_1[s] / nEv;
-
-    hQ.SetBinContent(s + 1, 1, nEv);
-    hQ.SetBinContent(s + 1, 2, C1);
-    hQ.SetBinContent(s + 1, 3, C2);
-    hQ.SetBinContent(s + 1, 4, C3);
-    hQ.SetBinContent(s + 1, 5, C4);
-    hQ.SetBinContent(s + 1, 6, Ntot); // <N+ + N->
-  }
+  setRow(1, acc.nEventsPerSample);
+  setRow(2, acc.qAcc_1_1_1);
+  setRow(3, acc.qAcc_2_1_1);
+  setRow(4, acc.qAcc_1_2_1);
+  setRow(5, acc.qAcc_1_2_2);
+  setRow(6, acc.qAcc_3_1_1);
+  setRow(7, acc.qAcc_1_1_1_x_1_2_1);
+  setRow(8, acc.qAcc_1_1_1_x_1_2_2);
+  setRow(9, acc.qAcc_1_3_2);
+  setRow(10, acc.qAcc_1_3_3);
+  setRow(11, acc.qAcc_4_1_1);
+  setRow(12, acc.qAcc_2_1_1_x_1_2_1);
+  setRow(13, acc.qAcc_2_1_1_x_1_2_2);
+  setRow(14, acc.qAcc_2_2_1);
+  setRow(15, acc.qAcc_2_2_2);
+  setRow(16, acc.qAcc_1_1_1_x_1_3_2);
+  setRow(17, acc.qAcc_1_1_1_x_1_3_3);
+  setRow(18, acc.qAcc_1_2_1_x_1_2_2);
+  setRow(19, acc.qAcc_1_4_1);
+  setRow(20, acc.qAcc_1_4_2);
+  setRow(21, acc.qAcc_1_4_3);
+  setRow(22, acc.qAcc_1_4_4);
 
   fOut->cd();
-  hQ.Write();
+  hRaw.Write();
 }
 
 // ─── Main macro ───────────────────────────────────────────────────────────────
 void computeMCCumulantsWithEfficiency(std::vector<CutSet> cutSets = {
                                           //{"pt0.2_2_eta_2_4", 0.2, 2.0, 2.0, 4.0}, {"pt0.5_2_eta_2_4", 0.5, 2.0, 2.0, 4.0}, {"pt0.75_2_eta_2_4", 0.75, 2.0, 2.0, 4.0}, {"pt1_2_eta_2_4", 1.0, 2.0, 2.0, 4.0}, {"pt0.2_2_eta_2_3", 0.2, 2.0, 2.0, 3.0}, {"pt0.5_2_eta_2_3", 0.5, 2.0, 2.0, 3.0}, {"pt0.75_2_eta_2_3", 0.75, 2.0, 2.0, 3.0}, {"pt1_2_eta_2_3", 1.0, 2.0, 2.0, 3.0}, {"pt0.2_2_eta_2_3.5", 0.2, 2.0, 2.0, 3.5}, {"pt0.5_2_eta_2_3.5", 0.5, 2.0, 2.0, 3.5}, {"pt0.75_2_eta_2_3.5", 0.75, 2.0, 2.0, 3.5}, {"pt1_2_eta_2_3.5", 1.0, 2.0, 2.0, 3.5}, {"pt0.2_2_eta_2_2.5", 0.2, 2.0, 2.0, 2.5}, {"pt0.5_2_eta_2_2.5", 0.5, 2.0, 2.0, 2.5}, {"pt0.75_2_eta_2_2.5", 0.75, 2.0, 2.0, 2.5}, {"pt1_2_eta_2_2.5", 1.0, 2.0, 2.0, 2.5}},
                                           {"pt0.2_2.5_eta_2_3.5", 0.2, 2.5, 2.0, 3.5}},
-                                      TString inputFilePath = "/data/galocco/output_PbPb.7.5.C0-5-netCharge.root", TString efficiencyFilePath = "/data/galocco/TheFIST_PbPb.7.5.C0-5-Lambda/ChargeEfficiency.root", int pdgToSelect = 0, bool doNet = true, float branchingRatio = 0.639)
+                                      //TString inputFilePath = "/data/galocco/output_PbPb.7.5.C0-5-netCharge.root",
+                                      TString inputFilePath = "output.root",
+                                      TString efficiencyFilePath = "/data/galocco/TheFIST_PbPb.7.5.C0-5-Lambda/ChargeEfficiency.root",
+                                      int pdgToSelect = 0, bool doNet = true, float branchingRatio = 0.639)
 {
   if (cutSets.empty())
   {
@@ -185,7 +222,7 @@ void computeMCCumulantsWithEfficiency(std::vector<CutSet> cutSets = {
     return;
   }
   const int nCuts = static_cast<int>(cutSets.size());
-
+  float mass = 0.f;
   TString histEff3DPart = "hEff3D";
   TString histEff3DAntiPart = "hEffAnti3D";
   if (pdgToSelect == 0)
@@ -193,6 +230,9 @@ void computeMCCumulantsWithEfficiency(std::vector<CutSet> cutSets = {
     branchingRatio = 1.0;
     histEff3DPart = "hEff3DPos";
     histEff3DAntiPart = "hEff3DNeg";
+  }
+  else {
+    mass = TDatabasePDG::Instance()->GetParticle(pdgToSelect)->Mass();
   }
 
   TFile *filPow = TFile::Open(inputFilePath, "READ");
@@ -223,12 +263,10 @@ void computeMCCumulantsWithEfficiency(std::vector<CutSet> cutSets = {
   }
 
   int pdg{0}, event{0};
-  float en{0.f}, px{0.f}, py{0.f}, pz{0.f};
+  float pt{0.f}, pz{0.f};
   kineTree->SetBranchAddress("event", &event);
   kineTree->SetBranchAddress("pdg", &pdg);
-  kineTree->SetBranchAddress("E", &en);
-  kineTree->SetBranchAddress("px", &px);
-  kineTree->SetBranchAddress("py", &py);
+  kineTree->SetBranchAddress("pt", &pt);
   kineTree->SetBranchAddress("pz", &pz);
 
   TFile fmc(efficiencyFilePath);
@@ -319,16 +357,24 @@ void computeMCCumulantsWithEfficiency(std::vector<CutSet> cutSets = {
   std::cout << "kineTree->GetEntries(): " << kineTree->GetEntries() << "\n";
   std::cout << "Processing " << nCuts << " cut set(s) + ideal variants.\n";
 
-  std::unordered_map<int, int> chargeCache;
-  auto getCharge = [&](int pdg) -> int
+
+  std::unordered_map<int, ParticleInfo> particleCache;
+
+  auto getParticleInfo = [&](int pdg) -> const ParticleInfo&
   {
-    auto it = chargeCache.find(pdg);
-    if (it != chargeCache.end())
+    auto it = particleCache.find(pdg);
+    if (it != particleCache.end()) {
       return it->second;
-    auto *p = TDatabasePDG::Instance()->GetParticle(pdg);
-    int ch = p ? (int)p->Charge() : 0;
-    chargeCache[pdg] = ch;
-    return ch;
+    }
+
+    auto* p = TDatabasePDG::Instance()->GetParticle(pdg);
+
+    ParticleInfo info;
+    info.charge = p ? static_cast<int>(p->Charge()) : 0;
+    info.mass   = p ? p->Mass() : 0.0;
+
+    auto [insertedIt, _] = particleCache.emplace(pdg, info);
+    return insertedIt->second;
   };
   for (int64_t iev = 0; iev < nevents;)
   {
@@ -378,7 +424,9 @@ void computeMCCumulantsWithEfficiency(std::vector<CutSet> cutSets = {
 
       if (pdgToSelect == 0)
       {
-        int charge = getCharge(pdg);
+        const auto &partInfo = getParticleInfo(pdg);
+        int charge = partInfo.charge;
+        mass = partInfo.mass;
         if (charge == 0)
           continue;
         isPart = charge > 0;
@@ -388,7 +436,8 @@ void computeMCCumulantsWithEfficiency(std::vector<CutSet> cutSets = {
       if (!isPart && !isAntiPart)
         continue;
 
-      TLorentzVector mom(px, py, pz, en);
+      double en = std::sqrt(pt * pt + pz * pz + mass * mass);
+      TLorentzVector mom(pt, 0., pz, en);
       const double rap = mom.Rapidity();
       const double p = mom.P();
       const double pt = mom.Pt();
@@ -457,8 +506,8 @@ void computeMCCumulantsWithEfficiency(std::vector<CutSet> cutSets = {
 
   for (int ic = 0; ic < nCuts; ++ic)
   {
-    writeAccumulators(acc[ic], cutSets[ic].label, fOut);
-    writeAccumulators(acc[nCuts + ic], cutSets[ic].label + "_ideal", fOut);
+    writeRawAccumulators(acc[ic], cutSets[ic].label, fOut);
+    writeRawAccumulators(acc[nCuts + ic], cutSets[ic].label + "_ideal", fOut);
     fOut->cd();
     hPY[ic]->Write();
     hPYr[ic]->Write();
