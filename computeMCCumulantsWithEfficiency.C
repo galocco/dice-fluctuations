@@ -210,7 +210,13 @@ void writeRawAccumulators(const Accumulators &acc,
 // ─── Main macro ───────────────────────────────────────────────────────────────
 void computeMCCumulantsWithEfficiency(std::vector<CutSet> cutSets = {
                                           //{"pt0.2_2_eta_2_4", 0.2, 2.0, 2.0, 4.0}, {"pt0.5_2_eta_2_4", 0.5, 2.0, 2.0, 4.0}, {"pt0.75_2_eta_2_4", 0.75, 2.0, 2.0, 4.0}, {"pt1_2_eta_2_4", 1.0, 2.0, 2.0, 4.0}, {"pt0.2_2_eta_2_3", 0.2, 2.0, 2.0, 3.0}, {"pt0.5_2_eta_2_3", 0.5, 2.0, 2.0, 3.0}, {"pt0.75_2_eta_2_3", 0.75, 2.0, 2.0, 3.0}, {"pt1_2_eta_2_3", 1.0, 2.0, 2.0, 3.0}, {"pt0.2_2_eta_2_3.5", 0.2, 2.0, 2.0, 3.5}, {"pt0.5_2_eta_2_3.5", 0.5, 2.0, 2.0, 3.5}, {"pt0.75_2_eta_2_3.5", 0.75, 2.0, 2.0, 3.5}, {"pt1_2_eta_2_3.5", 1.0, 2.0, 2.0, 3.5}, {"pt0.2_2_eta_2_2.5", 0.2, 2.0, 2.0, 2.5}, {"pt0.5_2_eta_2_2.5", 0.5, 2.0, 2.0, 2.5}, {"pt0.75_2_eta_2_2.5", 0.75, 2.0, 2.0, 2.5}, {"pt1_2_eta_2_2.5", 1.0, 2.0, 2.0, 2.5}},
-                                          {"pt0.2_2.5_eta_2_3.5", 0.2, 2.5, 2.0, 3.5}},
+                                          {"pt0.2_2.5_eta_2_3.5", 0.2, 2.5, 2.0, 3.5},
+                                          {"pt0.2_2.5_eta_2_3", 0.2, 2.5, 2.0, 3.0},
+                                          {"pt0.2_2_eta_2_3.5", 0.2, 2.0, 2.0, 3.5},
+                                          {"pt0.2_2_eta_2_3", 0.2, 2.0, 2.0, 3.0}
+                                          
+                                        
+                                        },
                                       //TString inputFilePath = "/data/galocco/output_PbPb.7.5.C0-5-netCharge.root",
                                       TString inputFilePath = "output.root",
                                       TString efficiencyFilePath = "/data/galocco/TheFIST_PbPb.7.5.C0-5-Lambda/ChargeEfficiency.root",
@@ -502,7 +508,7 @@ void computeMCCumulantsWithEfficiency(std::vector<CutSet> cutSets = {
     }
   } // end event loop
 
-  TFile *fOut = TFile::Open("fOutAll.root", "RECREATE");
+  TFile *fOut = TFile::Open("Accumulators.root", "RECREATE");
 
   for (int ic = 0; ic < nCuts; ++ic)
   {

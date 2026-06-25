@@ -28,7 +28,11 @@
 #include <algorithm>
 #include <memory>
 #include <cmath>
+#include <filesystem>
+
 gErrorIgnoreLevel = kWarning;
+
+static const double kBoxHalfWidth = 0.05; // half-width in x for ideal error boxes
 
 // ─── Accumulator field layout ────────────────────────────────────────────────
 // Must stay in sync with writeRawAccumulators in the compute macro.
@@ -213,9 +217,12 @@ CumulantResults extractResults(TFile& f, const std::string& label,
 }
 
 // ─── One plot per label: ideal points + non-ideal rescaled error bars ─────────
+// plotIdealErr: if true, overlay a second graph showing the ideal (unrescaled)
+//               statistical errors from the ideal sample itself.
 bool analyseLabel(TFile& f, const std::string& label, TFile& fOut,
                   double energy = 8.8, int pdg = 3122,
-                  bool net = false, double targetEvents = 4.5e9)
+                  bool net = false, double targetEvents = 4.5e9,
+                  bool plotIdealErr = false, TString dir = "./")
 {
   const CumulantResults real  = extractResults(f, label, targetEvents, net);
   const CumulantResults ideal = extractResults(f, label + "_ideal", targetEvents, net);
@@ -226,12 +233,21 @@ bool analyseLabel(TFile& f, const std::string& label, TFile& fOut,
   const char* firstRatioLabel = net ? "k2/<Ntot>" : "k2/k1";
   std::cout << "\n=== " << label << " (ideal values, real errors) ===" << std::endl;
   std::cout << "N_ev  = " << ideal.nev << std::endl;
-  std::cout << firstRatioLabel << " = " << ideal.k2k1 << " +/- " << ideal.errK2K1
-            << "  (rescaled: " << real.errK2K1R << ")" << std::endl;
-  std::cout << "k3/k1 = " << ideal.k3k1 << " +/- " << ideal.errK3K1
-            << "  (rescaled: " << real.errK3K1R << ")" << std::endl;
-  std::cout << "k4/k2 = " << ideal.k4k2 << " +/- " << ideal.errK4K2
-            << "  (rescaled: " << real.errK4K2R << ")" << std::endl;
+  std::cout << firstRatioLabel << " = " << ideal.k2k1
+            << " +/- " << ideal.errK2K1
+            << "  (rescaled: " << real.errK2K1R << ")"
+            << (plotIdealErr ? Form("  (ideal stat: %g)", ideal.errK2K1R) : "")
+            << std::endl;
+  std::cout << "k3/k1 = " << ideal.k3k1
+            << " +/- " << ideal.errK3K1
+            << "  (rescaled: " << real.errK3K1R << ")"
+            << (plotIdealErr ? Form("  (ideal stat: %g)", ideal.errK3K1R) : "")
+            << std::endl;
+  std::cout << "k4/k2 = " << ideal.k4k2
+            << " +/- " << ideal.errK4K2
+            << "  (rescaled: " << real.errK4K2R << ")"
+            << (plotIdealErr ? Form("  (ideal stat: %g)", ideal.errK4K2R) : "")
+            << std::endl;
 
   // ── Output histogram: ideal central values, real rescaled errors ───────────
   TH1D hCR(Form("hCRescaled_%s", label.c_str()), ";Order;#kappa", 3, 0, 3);
@@ -257,21 +273,53 @@ bool analyseLabel(TFile& f, const std::string& label, TFile& fOut,
   hFrame.GetXaxis()->SetLabelSize(0.065);
   hFrame.GetYaxis()->SetTitleSize(0.05);
   hFrame.GetYaxis()->SetLabelSize(0.04);
-  gStyle->SetOptStat(0);
-  hFrame.Draw("AXIS");
 
   double x[3]  = {1.0, 2.0, 3.0};
   double ex[3] = {0., 0., 0.};
   double y[3]  = {ideal.k2k1,    ideal.k3k1,    ideal.k4k2};
-  double ey[3] = {real.errK2K1R, real.errK3K1R, real.errK4K2R};
+  double eyR[3] = {real.errK2K1R,  real.errK3K1R,  real.errK4K2R};  // rescaled real
+  double eyI[3] = {ideal.errK2K1, ideal.errK3K1, ideal.errK4K2};    // ideal (unrescaled)
+  double yPlusEyI[3] = {y[0] + eyI[0], y[1] + eyI[1], y[2] + eyI[2]};
+  
+  // maximum of y + ideal.err for setting the y-axis range
+  double ymax = *std::max_element(yPlusEyI, yPlusEyI + 3);
+  hFrame.GetYaxis()->SetRangeUser(0, ymax + 0.01);
+  gStyle->SetOptStat(0);
+  hFrame.Draw("AXIS");
 
-  TGraphErrors gR(3, x, y, ex, ey);
+  // Graph 1: ideal central values + rescaled real errors (classic error bars)
+  TGraphErrors gR(3, x, y, ex, eyR);
   gR.SetMarkerStyle(20);
   gR.SetMarkerSize(1.0);
   gR.SetMarkerColor(kRed + 1);
   gR.SetLineColor(kRed + 1);
   gR.SetLineWidth(2);
   gR.Draw("P SAME");
+
+  // Graph 2 (optional): ideal stat errors as boxes + markers on top
+  std::unique_ptr<TGraphAsymmErrors> gIBox;
+  std::unique_ptr<TGraphErrors>      gIMark;
+  if (plotIdealErr) {
+    double exBoxL[3] = {kBoxHalfWidth, kBoxHalfWidth, kBoxHalfWidth};
+    double exBoxH[3] = {kBoxHalfWidth, kBoxHalfWidth, kBoxHalfWidth};
+    gIBox = std::make_unique<TGraphAsymmErrors>(3, x, y, exBoxL, exBoxH, eyI, eyI);
+    gIBox->SetFillColorAlpha(kBlue + 1, 0.25);
+    gIBox->SetFillStyle(1001);
+    gIBox->SetLineWidth(0);
+    gIBox->Draw("2 SAME");
+  }
+
+  // Legend (only when both series are shown)
+  std::unique_ptr<TLegend> leg;
+  if (plotIdealErr) {
+    leg = std::make_unique<TLegend>(0.19, 0.2, 0.62, 0.3);
+    leg->SetBorderSize(0);
+    leg->SetFillStyle(0);
+    leg->SetTextSize(0.035);
+    leg->AddEntry(&gR, "Expected statistical uncertainty", "lp");
+    leg->AddEntry(gIBox.get(), "Uncertainty with the simulated data", "f");
+    leg->Draw();
+  }
 
   TLatex latex;
   latex.SetNDC();
@@ -303,8 +351,8 @@ bool analyseLabel(TFile& f, const std::string& label, TFile& fOut,
       Form("%s #leq #it{p}_{T} #leq %s GeV/#it{c}",
           fmt(numbers[0]), fmt(numbers[1])));
 
-  cR.SaveAs(Form("cumulants_rescaled_%s.pdf", label.c_str()));
-  cR.SaveAs(Form("cumulants_rescaled_%s.png", label.c_str()));
+  cR.SaveAs(Form("%s/cumulants_rescaled_%s.pdf", dir.Data(), label.c_str()));
+  cR.SaveAs(Form("%s/cumulants_rescaled_%s.png", dir.Data(), label.c_str()));
 
   fOut.cd();
   hCR.Write();
@@ -317,7 +365,8 @@ bool analyseLabel(TFile& f, const std::string& label, TFile& fOut,
 void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
                       TFile& fOut, double energy = 8.8,
                       int pdg = 3122, bool net = false,
-                      double targetEvents = 4.5e9)
+                      double targetEvents = 4.5e9,
+                      bool plotIdealErr = false, TString dir = "./")
 {
   std::vector<std::string> ptTags;
   for (const auto& lbl : labels) {
@@ -387,9 +436,9 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
     if (N == 0) continue;
 
     std::vector<double> etaHi(N), ex(N, 0.);
-    std::vector<double> yK2K1(N), eyK2K1(N);
-    std::vector<double> yK3K1(N), eyK3K1(N);
-    std::vector<double> yK4K2(N), eyK4K2(N);
+    std::vector<double> yK2K1(N),  eyK2K1R(N),  eyK2K1I(N);
+    std::vector<double> yK3K1(N),  eyK3K1R(N),  eyK3K1I(N);
+    std::vector<double> yK4K2(N),  eyK4K2R(N),  eyK4K2I(N);
 
     double etaLo = 0.;
     for (int i = 0; i < N; ++i) {
@@ -402,18 +451,26 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
       const CumulantResults ideal = extractResults(fIn, lbl + "_ideal", targetEvents, net);
       if (!real.valid || !ideal.valid) {
         yK2K1[i] = yK3K1[i] = yK4K2[i] = 0.;
-        eyK2K1[i] = eyK3K1[i] = eyK4K2[i] = 0.;
+        eyK2K1R[i] = eyK3K1R[i] = eyK4K2R[i] = 0.;
+        eyK2K1I[i] = eyK3K1I[i] = eyK4K2I[i] = 0.;
         continue;
       }
-      yK2K1[i]  = ideal.k2k1;    eyK2K1[i]  = real.errK2K1R;
-      yK3K1[i]  = ideal.k3k1;    eyK3K1[i]  = real.errK3K1R;
-      yK4K2[i]  = ideal.k4k2;    eyK4K2[i]  = real.errK4K2R;
+      yK2K1[i]   = ideal.k2k1;    eyK2K1R[i]  = real.errK2K1R;  eyK2K1I[i]  = ideal.errK2K1;
+      yK3K1[i]   = ideal.k3k1;    eyK3K1R[i]  = real.errK3K1R;  eyK3K1I[i]  = ideal.errK3K1;
+      yK4K2[i]   = ideal.k4k2;    eyK4K2R[i]  = real.errK4K2R;  eyK4K2I[i]  = ideal.errK4K2;
     }
 
     auto [ptLo, ptHi] = ptRange(tag);
 
-    double* yArr[3]  = {yK2K1.data(),  yK3K1.data(),  yK4K2.data()};
-    double* eyArr[3] = {eyK2K1.data(), eyK3K1.data(), eyK4K2.data()};
+    double* yArr[3]   = {yK2K1.data(),   yK3K1.data(),   yK4K2.data()};
+    double* eyArrR[3] = {eyK2K1R.data(), eyK3K1R.data(), eyK4K2R.data()};
+    double* eyArrI[3] = {eyK2K1I.data(), eyK3K1I.data(), eyK4K2I.data()};
+
+    double ymax = 0;
+    for (int r = 0; r < 3; ++r) {
+      for (int j = 0; j < N; ++j)
+        ymax = std::max(ymax, yArr[r][j] + eyArrI[r][j]);
+    }
 
     for (int r = 0; r < 3; ++r) {
       std::string cName = Form("cVsEta_%s_%s", tag.c_str(), ratioNames[r]);
@@ -424,9 +481,12 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
       c.SetTopMargin(0.05);
       c.SetRightMargin(0.04);
 
-      double yminErr = yArr[r][0] - eyArr[r][0];
+      double yminErr = yArr[r][0] - eyArrR[r][0];
       for (int j = 1; j < N; ++j)
-        yminErr = std::min(yminErr, yArr[r][j] - eyArr[r][j]);
+        yminErr = std::min(yminErr, yArr[r][j] - eyArrR[r][j]);
+      if (plotIdealErr)
+        for (int j = 0; j < N; ++j)
+          yminErr = std::min(yminErr, yArr[r][j] - eyArrI[r][j]);
 
       TH1D hF(Form("hFrameEta_%s_%s", tag.c_str(), ratioNames[r]),
               Form(";#eta_{max};%s", ratioTitles[r].c_str()),
@@ -441,34 +501,75 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
       hF.GetYaxis()->SetTitleSize(0.05);
       hF.GetXaxis()->SetLabelSize(0.04);
       hF.GetYaxis()->SetLabelSize(0.04);
+      hF.GetYaxis()->SetRangeUser(0, ymax + 0.01);
       gStyle->SetOptStat(0);
       hF.Draw();
 
-      TGraphErrors g(N, etaHi.data(), yArr[r], ex.data(), eyArr[r]);
-      g.SetMarkerStyle(20);
-      g.SetMarkerSize(1.2);
-      g.SetMarkerColor(kRed + 1);
-      g.SetLineColor(kRed + 1);
-      g.SetLineWidth(2);
-      g.Draw("P SAME");
+      // Rescaled real errors (classic error bars)
+      TGraphErrors gR(N, etaHi.data(), yArr[r], ex.data(), eyArrR[r]);
+      gR.SetMarkerStyle(20);
+      gR.SetMarkerSize(1.2);
+      gR.SetMarkerColor(kRed + 1);
+      gR.SetLineColor(kRed + 1);
+      gR.SetLineWidth(2);
+      gR.Draw("P SAME");
+
+      // Ideal errors (optional): box + markers on top
+      std::unique_ptr<TGraphAsymmErrors> gIBox;
+      std::unique_ptr<TGraphErrors>      gIMark;
+      if (plotIdealErr) {
+        std::vector<double> exBL(N, kBoxHalfWidth), exBH(N, kBoxHalfWidth);
+        std::vector<double> exZ(N, 0.);
+        gIBox = std::make_unique<TGraphAsymmErrors>(
+            N, etaHi.data(), yArr[r],
+            exBL.data(), exBH.data(), eyArrI[r], eyArrI[r]);
+        gIBox->SetFillColorAlpha(kBlue + 1, 0.25);
+        gIBox->SetFillStyle(1001);
+        gIBox->SetLineWidth(0);
+        gIBox->Draw("2 SAME");
+
+        gIMark = std::make_unique<TGraphErrors>(
+            N, etaHi.data(), yArr[r], exZ.data(), eyArrI[r]);
+        gIMark->SetMarkerStyle(24);
+        gIMark->SetMarkerSize(1.2);
+        gIMark->SetMarkerColor(kBlue + 1);
+        gIMark->SetLineColor(kBlue + 1);
+        gIMark->SetLineWidth(2);
+        gIMark->Draw("P SAME");
+      }
+
+      std::unique_ptr<TLegend> leg;
+      if (plotIdealErr) {
+        
+        leg = std::make_unique<TLegend>(0.19, 0.5-0.05*2, 0.65, 0.5);
+        leg->SetBorderSize(0);
+        leg->SetFillStyle(0);
+        leg->SetTextSize(0.033);
+        leg->AddEntry(&gR, "Expected statistical uncertainty", "lp");
+        leg->AddEntry(gIBox.get(), "Uncertainty with the simulated data", "f");
+        leg->Draw();
+      }
 
       TLatex latex;
       latex.SetNDC();
       latex.SetTextSize(0.038);
       latex.SetTextFont(42);
-      latex.DrawLatex(0.38, 0.88, "NA60+/DiCE Performance");
-      latex.DrawLatex(0.38, 0.83,
+      double legOffset = plotIdealErr ? 0.14 : 0.;
+      latex.DrawLatex(0.19, 0.47 - legOffset, "NA60+/DiCE Performance");
+      latex.DrawLatex(0.19, 0.47 - 0.05 - legOffset,
           Form("Pb#font[122]{-}Pb,  #sqrt{s_{NN}} = %0.1f GeV, 0-5%%", energy));
-      latex.DrawLatex(0.38, 0.78,
+      latex.DrawLatex(0.19, 0.47 - 0.10 - legOffset,
           Form("%s #leq #it{#eta} #leq #it{#eta}_{max}", fmt(etaLo)));
-      latex.DrawLatex(0.38, 0.73,
+      latex.DrawLatex(0.19, 0.47 - 0.15 - legOffset,
           Form("%s #leq #it{p}_{T} #leq %s GeV/#it{c}", fmt(ptLo), fmt(ptHi)));
 
-      c.SaveAs(Form("vsEta_%s_%s.pdf", tag.c_str(), ratioNames[r]));
-      c.SaveAs(Form("vsEta_%s_%s.png", tag.c_str(), ratioNames[r]));
+      c.SaveAs(Form("%s/vsEta_%s_%s.pdf", dir.Data(), tag.c_str(), ratioNames[r]));
+      c.SaveAs(Form("%s/vsEta_%s_%s.png", dir.Data(), tag.c_str(), ratioNames[r]));
 
       fOut.cd();
-      g.Write(Form("gVsEta_%s_%s", tag.c_str(), ratioNames[r]));
+      gR.Write(Form("gVsEta_%s_%s_real", tag.c_str(), ratioNames[r]));
+      if (gIBox)  gIBox->Write(Form("gVsEta_%s_%s_idealBox",  tag.c_str(), ratioNames[r]));
+      if (gIMark) gIMark->Write(Form("gVsEta_%s_%s_idealMark", tag.c_str(), ratioNames[r]));
       c.Write();
     }
   }
@@ -477,7 +578,9 @@ void analyseVsEtaCuts(TFile& fIn, const std::vector<std::string>& labels,
 // ─── ki/kj vs eta_max overlaid for all pt selections ────────────────────────
 void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
                          TFile& fOut, double energy = 8.8,
-                         int pdg = 3122, bool net = false, double targetEvents = 4.5e9)
+                         int pdg = 3122, bool net = false,
+                         double targetEvents = 4.5e9,
+                         bool plotIdealErr = false, TString dir = "./")
 {
   auto etaRange = [](const std::string& lbl) -> std::pair<double,double> {
     auto pos = lbl.find("_eta_");
@@ -522,7 +625,8 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
   const int kColors[] = {kRed+1, kBlue+1, kGreen+2, kOrange+1,
                           kMagenta+1, kCyan+2, kViolet+1, kTeal+2};
   const int nColors = (int)(sizeof(kColors)/sizeof(kColors[0]));
-  const int kMarkers[] = {20, 21, 22, 23, 29, 33, 34, 47};
+  const int kMarkers[]     = {20, 21, 22, 23, 29, 33, 34, 47}; // filled
+  const int kMarkersOpen[] = {24, 25, 26, 32, 30, 27, 28, 46}; // open counterparts
 
   std::vector<std::string> ptTags;
   for (const auto& lbl : labels) {
@@ -546,11 +650,15 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
   for (const auto& lbl : labels) { etaLo = etaRange(lbl).first; break; }
 
   const int Npt = (int)ptTags.size();
+  // [pt][ratio][eta] for rescaled-real and ideal errors
   std::vector<std::vector<std::vector<double>>> yData(Npt,
       std::vector<std::vector<double>>(3, std::vector<double>(Neta, 0.)));
-  std::vector<std::vector<std::vector<double>>> eyData(Npt,
+  std::vector<std::vector<std::vector<double>>> eyDataR(Npt,
+      std::vector<std::vector<double>>(3, std::vector<double>(Neta, 0.)));
+  std::vector<std::vector<std::vector<double>>> eyDataI(Npt,
       std::vector<std::vector<double>>(3, std::vector<double>(Neta, 0.)));
 
+  double ymax = 0;
   for (int p = 0; p < Npt; ++p) {
     for (int e = 0; e < Neta; ++e) {
       std::string lbl;
@@ -564,9 +672,12 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
       const CumulantResults real  = extractResults(fIn, lbl, targetEvents, net);
       const CumulantResults ideal = extractResults(fIn, lbl + "_ideal", targetEvents, net);
       if (!real.valid || !ideal.valid) continue;
-      yData[p][0][e]  = ideal.k2k1;  eyData[p][0][e]  = real.errK2K1R;
-      yData[p][1][e]  = ideal.k3k1;  eyData[p][1][e]  = real.errK3K1R;
-      yData[p][2][e]  = ideal.k4k2;  eyData[p][2][e]  = real.errK4K2R;
+      yData[p][0][e]  = ideal.k2k1;  eyDataR[p][0][e] = real.errK2K1R;  eyDataI[p][0][e] = ideal.errK2K1;
+      yData[p][1][e]  = ideal.k3k1;  eyDataR[p][1][e] = real.errK3K1R;  eyDataI[p][1][e] = ideal.errK3K1;
+      yData[p][2][e]  = ideal.k4k2;  eyDataR[p][2][e] = real.errK4K2R;  eyDataI[p][2][e] = ideal.errK4K2;
+      ymax = std::max<double>(ymax, yData[p][0][e] + eyDataI[p][0][e]);
+      ymax = std::max<double>(ymax, yData[p][1][e] + eyDataI[p][1][e]);
+      ymax = std::max<double>(ymax, yData[p][2][e] + eyDataI[p][2][e]);
     }
   }
 
@@ -575,8 +686,11 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
   for (int r = 0; r < 3; ++r) {
     double yminErr = 1e9;
     for (int p = 0; p < Npt; ++p)
-      for (int e = 0; e < Neta; ++e)
-        yminErr = std::min(yminErr, yData[p][r][e] - eyData[p][r][e]);
+      for (int e = 0; e < Neta; ++e) {
+        yminErr = std::min(yminErr, yData[p][r][e] - eyDataR[p][r][e]);
+        if (plotIdealErr)
+          yminErr = std::min(yminErr, yData[p][r][e] - eyDataI[p][r][e]);
+      }
 
     std::string cName = Form("cVsEtaOverlay_%s", ratioNames[r]);
     TCanvas c(cName.c_str(), cName.c_str(), 800, 700);
@@ -596,35 +710,76 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
     hF.GetYaxis()->SetTitleSize(0.05);
     hF.GetXaxis()->SetLabelSize(0.04);
     hF.GetYaxis()->SetLabelSize(0.04);
+    hF.GetYaxis()->SetRangeUser(0, ymax + 0.01);
     gStyle->SetOptStat(0);
     hF.Draw("AXIS");
 
-    std::vector<std::unique_ptr<TGraphErrors>> graphs(Npt);
+    std::vector<std::unique_ptr<TGraphErrors>>      graphsR(Npt);
+    std::vector<std::unique_ptr<TGraphAsymmErrors>> graphsI(Npt);     // ideal error boxes
+    std::vector<std::unique_ptr<TGraphErrors>>      graphsIMark(Npt); // ideal markers on top
     for (int p = 0; p < Npt; ++p) {
       std::vector<double> xs(Neta);
       for (int e = 0; e < Neta; ++e) xs[e] = etaHiAll[e];
-      graphs[p] = std::make_unique<TGraphErrors>(
-          Neta, xs.data(), yData[p][r].data(),
-          ex.data(), eyData[p][r].data());
       int col = kColors[p % nColors];
-      graphs[p]->SetMarkerStyle(kMarkers[p % nColors]);
-      graphs[p]->SetMarkerSize(1.2);
-      graphs[p]->SetMarkerColor(col);
-      graphs[p]->SetLineColor(col);
-      graphs[p]->SetLineWidth(2);
-      graphs[p]->Draw("P SAME");
+
+      // Rescaled real errors — classic error bars
+      graphsR[p] = std::make_unique<TGraphErrors>(
+          Neta, xs.data(), yData[p][r].data(),
+          ex.data(), eyDataR[p][r].data());
+      graphsR[p]->SetMarkerStyle(kMarkers[p % nColors]);
+      graphsR[p]->SetMarkerSize(1.2);
+      graphsR[p]->SetMarkerColor(col);
+      graphsR[p]->SetLineColor(col);
+      graphsR[p]->SetLineWidth(2);
+      graphsR[p]->Draw("P SAME");
+
+      // Ideal errors — box (TGraphAsymmErrors) + open markers on top
+      if (plotIdealErr) {
+        std::vector<double> exBL(Neta, kBoxHalfWidth), exBH(Neta, kBoxHalfWidth);
+        std::vector<double> exZ(Neta, 0.);
+        // box
+        auto gIBox = std::make_unique<TGraphAsymmErrors>(
+            Neta, xs.data(), yData[p][r].data(),
+            exBL.data(), exBH.data(),
+            eyDataI[p][r].data(), eyDataI[p][r].data());
+        gIBox->SetFillColorAlpha(col, 0.20);
+        gIBox->SetFillStyle(1001);
+        gIBox->SetLineWidth(0);
+        gIBox->Draw("2 SAME");
+        // store box so it stays alive until canvas is saved
+        graphsI[p] = std::move(gIBox);
+      }
     }
 
+    auto tmpGraphR = std::unique_ptr<TGraphErrors>(
+        static_cast<TGraphErrors*>(graphsR[0]->Clone("tmpGraphR"))
+    );
+
+    tmpGraphR->SetMarkerColor(kGray + 1);
+    tmpGraphR->SetLineColor(kGray + 1);
+    auto tmpGraphI = std::unique_ptr<TGraphAsymmErrors>(
+        static_cast<TGraphAsymmErrors*>(graphsI[0]->Clone("tmpGraphI"))
+    );
+
+    tmpGraphI->SetFillColorAlpha(kGray + 1, 0.25);
+    tmpGraphI->SetFillStyle(1001);
+    tmpGraphI->SetLineWidth(0);
+    // Legend: one row per pt selection, filled+open if plotIdealErr
     double legY2 = 0.50;
-    TLegend leg(0.2, legY2 - 0.05*Npt, 0.55, legY2);
+    int nLegRows = plotIdealErr ? Npt + 2 : Npt; // +2 for error-type header entries
+    TLegend leg(0.2, legY2 - 0.05 * nLegRows, 0.65, legY2);
     leg.SetBorderSize(0);
     leg.SetFillStyle(0);
     leg.SetTextSize(0.033);
     for (int p = 0; p < Npt; ++p) {
       auto [ptLo, ptHi] = ptRange(ptTags[p]);
-      leg.AddEntry(graphs[p].get(),
-          Form("%s #leq #it{p}_{T} #leq %s GeV/#it{c}", fmt(ptLo), fmt(ptHi)),
-          "lp");
+      TString entryLabel = Form("%s #leq #it{p}_{T} #leq %s GeV/#it{c}", fmt(ptLo), fmt(ptHi));
+      leg.AddEntry(graphsR[p].get(), entryLabel, "lp");
+    }
+    if (plotIdealErr) {
+      // dummy entries explaining the two error styles
+      leg.AddEntry(tmpGraphR.get(), "Expected statistical uncertainty", "lp");
+      leg.AddEntry(tmpGraphI.get(), "Uncertainty with the simulated data", "f");
     }
     leg.Draw();
 
@@ -632,32 +787,41 @@ void analyseVsEtaOverlay(TFile& fIn, const std::vector<std::string>& labels,
     latex.SetNDC();
     latex.SetTextSize(0.038);
     latex.SetTextFont(42);
-    latex.DrawLatex(0.2+0.015, legY2 - 0.05*Npt - 0.03, "NA60+/DiCE Performance");
-    latex.DrawLatex(0.2+0.015, legY2 - 0.05*Npt - 0.08,
+    latex.DrawLatex(0.2+0.015, legY2 - 0.05*nLegRows - 0.03, "NA60+/DiCE Performance");
+    latex.DrawLatex(0.2+0.015, legY2 - 0.05*nLegRows - 0.08,
         Form("Pb#font[122]{-}Pb,  #sqrt{s_{NN}} = %0.1f GeV, 0-5%%", energy));
-    latex.DrawLatex(0.2+0.015, legY2 - 0.05*Npt - 0.13,
+    latex.DrawLatex(0.2+0.015, legY2 - 0.05*nLegRows - 0.13,
         Form("%s #leq #it{#eta} #leq #it{#eta}_{max}", fmt(etaLo)));
 
-    c.SaveAs(Form("vsEtaOverlay_%s.pdf", ratioNames[r]));
-    c.SaveAs(Form("vsEtaOverlay_%s.png", ratioNames[r]));
+    c.SaveAs(Form("%s/vsEtaOverlay_%s.pdf", dir.Data(), ratioNames[r]));
+    c.SaveAs(Form("%s/vsEtaOverlay_%s.png", dir.Data(), ratioNames[r]));
 
     fOut.cd();
-    for (int p = 0; p < Npt; ++p)
-      graphs[p]->Write(Form("gVsEtaOverlay_%s_%s",
-          ptTags[p].c_str(), ratioNames[r]));
+    for (int p = 0; p < Npt; ++p) {
+      graphsR[p]->Write(Form("gVsEtaOverlay_%s_%s_real",       ptTags[p].c_str(), ratioNames[r]));
+      if (graphsI[p])
+        graphsI[p]->Write(Form("gVsEtaOverlay_%s_%s_idealBox",   ptTags[p].c_str(), ratioNames[r]));
+      if (graphsIMark[p])
+        graphsIMark[p]->Write(Form("gVsEtaOverlay_%s_%s_idealMark", ptTags[p].c_str(), ratioNames[r]));
+    }
     c.Write();
   }
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
 void analyzeAndPlotCumulantRatios(std::vector<std::string> labels = {
-                                          "pt0.2_2.5_eta_2_3.5"
+                                          "pt0.2_2.5_eta_2_3.5",
+                                          "pt0.2_2.5_eta_2_3",
+                                          "pt0.2_2_eta_2_3.5",
+                                          "pt0.2_2_eta_2_3",
                                         },
                                         double energy = 7.5,
                                         int pdg = 0,
                                         bool net = true,
                                         double targetEvents = 4.5e9,
-                                        TString inputFile = "fOutAll.root"
+                                        TString inputFile = "netCharge/Accumulators.root",
+                                        TString outputFile = "netCharge/Cumulants.root",
+                                        bool plotIdealErr = true
                                       )
 {
   TFile fIn(inputFile);
@@ -666,13 +830,20 @@ void analyzeAndPlotCumulantRatios(std::vector<std::string> labels = {
     return;
   }
 
-  TFile fOut("fC.root", "RECREATE");
+  std::filesystem::path p(outputFile.Data());
+  TString dir = "./";
+  if (p.has_parent_path()) {
+    std::filesystem::create_directories(p.parent_path());
+    dir = p.parent_path().string();
+  }
+  TFile fOut(outputFile, "RECREATE");
+  printf("dir = %s\n", dir.Data());
 
   for (const std::string& lbl : labels)
-    analyseLabel(fIn, lbl, fOut, energy, pdg, net, targetEvents);
+    analyseLabel(fIn, lbl, fOut, energy, pdg, net, targetEvents, plotIdealErr, dir);
 
-  analyseVsEtaCuts(fIn, labels, fOut, energy, pdg, net, targetEvents);
-  analyseVsEtaOverlay(fIn, labels, fOut, energy, pdg, net, targetEvents);
+  analyseVsEtaCuts(fIn, labels, fOut, energy, pdg, net, targetEvents, plotIdealErr, dir);
+  analyseVsEtaOverlay(fIn, labels, fOut, energy, pdg, net, targetEvents, plotIdealErr, dir);
 
   fOut.Close();
 }
